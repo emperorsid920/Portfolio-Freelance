@@ -1,84 +1,93 @@
-import os
-from PIL import Image
-import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+import numpy as np
+import os
+from pathlib import Path
 
-# Define the path to the dataset directory (relative path)
-dataset_dir = "Dataset"
+# Set up paths
+data_dir = Path("/Users/sidkumar/Documents/Portfolio Freelance/Recycle/Dataset")
 categories = ["cardboard", "glass", "metal", "paper", "plastic", "trash"]
 
-
-# Function to load and preprocess images
-def load_images(dataset_dir, categories, img_size=(224, 224)):
-    data = []
+# Load and preprocess images with reduced size
+def load_images(data_dir, categories):
+    images = []
     labels = []
-
-    for category in categories:
-        category_path = os.path.join(dataset_dir, category)
-        if not os.path.exists(category_path):
-            print(f"Category path does not exist: {category_path}")
-            continue
-
-        label = categories.index(category)  # Assign a numeric label to each category
-        print(f"Loading images from category: {category}")
-
-        for img_name in os.listdir(category_path):
-            img_path = os.path.join(category_path, img_name)
-
+    for idx, category in enumerate(categories):
+        category_path = data_dir / category
+        for img_path in category_path.glob("*.jpg"):
             try:
-                img = Image.open(img_path)
-                img = img.resize(img_size)
-                img_array = np.array(img) / 255.0
-
-                data.append(img_array)
-                labels.append(label)
-
+                img = tf.keras.preprocessing.image.load_img(img_path, target_size=(100, 100))  # Reduced image size
+                img_array = tf.keras.preprocessing.image.img_to_array(img)
+                images.append(img_array)
+                labels.append(idx)
             except Exception as e:
-                print(f"Error loading image {img_name}: {e}")
+                print(f"Error loading image {img_path}: {e}")
+    return np.array(images), np.array(labels)
 
-    return np.array(data), np.array(labels)
+X, y = load_images(data_dir, categories)
+X = X / 255.0  # Normalize pixel values
 
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Load and preprocess the images
-train_images, train_labels = load_images(dataset_dir, categories)
+# Simplified data augmentation
+datagen = ImageDataGenerator(
+    rotation_range=20,  # Smaller rotation range
+    zoom_range=0.1,     # Smaller zoom range
+    horizontal_flip=True  # Only flip images horizontally
+)
 
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(train_images, train_labels, test_size=0.2, random_state=42)
+# Load the VGG16 model with ImageNet weights
+base_model = VGG16(weights='imagenet', include_top=False, input_shape=(100, 100, 3))  # Update input shape
+base_model.trainable = False  # Freeze the convolutional base
 
-# Define the CNN model
+# Build the model
 model = models.Sequential([
-    layers.Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
-    layers.MaxPooling2D((2, 2)),
-    layers.Conv2D(64, (3, 3), activation='relu'),
-    layers.MaxPooling2D((2, 2)),
-    layers.Conv2D(128, (3, 3), activation='relu'),
-    layers.MaxPooling2D((2, 2)),
+    base_model,
     layers.Flatten(),
-    layers.Dense(128, activation='relu'),
-    layers.Dense(6, activation='softmax')  # 6 output classes
+    layers.Dense(128, activation='relu'),  # Reduced the number of neurons
+    layers.Dropout(0.5),  # Add Dropout
+    layers.BatchNormalization(),  # Add Batch Normalization
+    layers.Dense(len(categories), activation='softmax')  # Adjust output layer for your number of classes
 ])
 
 # Compile the model
-model.compile(optimizer='adam',
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
-# Train the model
-history = model.fit(X_train, y_train, epochs=10, validation_split=0.2)
+# Define callbacks
+early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+learning_rate_reduction = ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.2, min_lr=1e-6)
+
+# Train the model with data augmentation and smaller batch size
+history = model.fit(
+    datagen.flow(X_train, y_train, batch_size=16),  # Smaller batch size
+    epochs=10,  # Start with fewer epochs
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, learning_rate_reduction]
+)
+
+# Fine-tuning: Unfreeze the base model and train further with a lower learning rate
+base_model.trainable = True
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Continue training with fine-tuning
+history_finetune = model.fit(
+    datagen.flow(X_train, y_train, batch_size=16),  # Smaller batch size
+    epochs=10,  # Limit fine-tuning epochs
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, learning_rate_reduction]
+)
 
 # Evaluate the model
-test_loss, test_accuracy = model.evaluate(X_test, y_test)
-print(f"Test Loss: {test_loss:.4f}")
-print(f"Test Accuracy: {test_accuracy:.4f}")
+test_loss, test_acc = model.evaluate(X_test, y_test)
+print(f"Test Loss: {test_loss}")
+print(f"Test Accuracy: {test_acc}")
 
-# Plot training & validation accuracy values
-plt.plot(history.history['accuracy'])
-plt.plot(history.history['val_accuracy'])
-plt.title('Model accuracy')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.legend(['Train', 'Test'], loc='upper left')
-plt.show()
+# Optional: Predict and generate classification report if needed
+y_pred = np.argmax(model.predict(X_test), axis=-1)
